@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { View, TextInput, Button, Text, StyleSheet, Alert } from 'react-native';
 import axios from 'axios';
 import { useRouter } from 'expo-router';
-
+const router = useRouter();
 
 const RegisterScreen = ({ navigation }) => {
   const [mobileNumber, setMobileNumber] = useState('');
@@ -10,8 +10,6 @@ const RegisterScreen = ({ navigation }) => {
   const [otpSent, setOtpSent] = useState(false);
   const [enteredOtp, setEnteredOtp] = useState('');
   const [verifying, setVerifying] = useState(false);
-  
-const router = useRouter();
 
   const handleSendOtp = async () => {
     if (!mobileNumber || mobileNumber.length < 10) {
