@@ -1,41 +1,63 @@
 const express = require('express');
 const oracledb = require('oracledb');
 const bodyParser = require('body-parser');
-const crypto = require('crypto');  // For generating OTP
+const crypto = require('crypto');
+const twilio = require('twilio');
+const cors = require('cors');
+
 const app = express();
 const port = 5000;
 
-const cors = require('cors');
-
-const cors = require('cors');
+// Middleware
 app.use(cors());
-
-
-// Middleware to parse JSON bodies
 app.use(bodyParser.json());
 
 // Oracle DB configuration
 oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
 
-async function insertOtp(mobileNumber, otp) {
+// Twilio configuration
+// Replace these with your actual Twilio credentials
+const twilioAccountSid = 'AC769d7091e2fb58d36365012f2698edba';
+const twilioAuthToken = '364ed417d8b4c9e7bd9c9cc72c55ef79';
+const twilioPhoneNumber = '+15515252060';
+const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
+
+// Connect to Oracle DB
+async function getConnection() {
+  return await oracledb.getConnection({
+    user: "hr",
+    password: "hr",
+    connectionString: "localhost/xepdb1"
+  });
+}
+
+// Generate 6-digit OTP
+function generateOtp() {
+  return crypto.randomInt(100000, 999999).toString();
+}
+
+// Store OTP in database
+async function storeOtp(mobileNumber, otp) {
   let connection;
   try {
-    connection = await oracledb.getConnection({
-      user: "hr",
-      password: "hr",
-      connectionString: "localhost/xepdb1"
-    });
+    connection = await getConnection();
 
-    // Set expiration time for OTP (e.g., 5 minutes)
+    // Set expiration time for OTP (5 minutes)
     const otpExpiration = new Date();
     otpExpiration.setMinutes(otpExpiration.getMinutes() + 5);
 
+    // First delete any existing OTPs for this mobile number
+    await connection.execute(
+      `DELETE FROM otp_requests WHERE mobile_number = :mobile_number`,
+      { mobile_number: mobileNumber }
+    );
+
+    // Insert new OTP
     const sql = `
       INSERT INTO otp_requests (mobile_number, otp, otp_expiration)
       VALUES (:mobile_number, :otp, :otp_expiration)
     `;
 
-    // Execute the SQL query
     await connection.execute(sql, {
       mobile_number: mobileNumber,
       otp: otp,
@@ -44,103 +66,152 @@ async function insertOtp(mobileNumber, otp) {
 
     // Commit the transaction
     await connection.commit();
-
+    return true;
   } catch (err) {
-    console.error(err);
-    throw err;
+    console.error('Error storing OTP:', err);
+    return false;
   } finally {
     if (connection) {
       try {
         await connection.close();
       } catch (err) {
-        console.error(err);
+        console.error('Error closing connection:', err);
       }
     }
   }
 }
 
-// Generate OTP
-function generateOtp() {
-  // Generate a 6-digit OTP
-  return crypto.randomInt(100000, 999999).toString();
+// Send OTP via Twilio
+async function sendSmsOtp(mobileNumber, otp) {
+  try {
+    await twilioClient.messages.create({
+      body: `Your verification code is: ${otp}. This code expires in 5 minutes.`,
+      from: twilioPhoneNumber,
+      to: mobileNumber
+    });
+    return true;
+  } catch (err) {
+    console.error('Twilio SMS error:', err);
+    return false;
+  }
 }
 
-// API to handle OTP registration
-app.post('/register', async (req, res) => {
+// Verify OTP from database
+async function verifyOtp(mobileNumber, otp) {
+  let connection;
+  try {
+    connection = await getConnection();
+
+    const result = await connection.execute(
+      `SELECT * FROM otp_requests 
+       WHERE mobile_number = :mobile_number 
+       AND otp = :otp 
+       AND otp_expiration > SYSDATE`,
+      {
+        mobile_number: mobileNumber,
+        otp: otp
+      }
+    );
+
+    return result.rows.length > 0;
+  } catch (err) {
+    console.error('Error verifying OTP:', err);
+    return false;
+  } finally {
+    if (connection) {
+      try {
+        await connection.close();
+      } catch (err) {
+        console.error('Error closing connection:', err);
+      }
+    }
+  }
+}
+
+// API endpoint to send OTP
+app.post('/send-otp', async (req, res) => {
   const { mobile_number } = req.body;
 
   if (!mobile_number) {
-    return res.status(400).json({ error: 'Mobile number is required' });
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Mobile number is required' 
+    });
   }
 
   try {
     // Generate OTP
     const otp = generateOtp();
 
-    // Insert OTP into the database
-    await insertOtp(mobile_number, otp);
+    // Store OTP in database
+    const stored = await storeOtp(mobile_number, otp);
+    if (!stored) {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to store OTP' 
+      });
+    }
 
-    // In a real application, you would send the OTP to the user's mobile number via SMS
-
-    return res.status(200).json({ message: 'OTP sent successfully', otp });
+    // Send OTP via SMS
+    const sent = await sendSmsOtp(mobile_number, otp);
+    
+    if (sent) {
+      return res.status(200).json({ 
+        success: true, 
+        message: 'OTP sent successfully' 
+      });
+    } else {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to send SMS. Please try again.' 
+      });
+    }
   } catch (err) {
-    return res.status(500).json({ error: 'Error inserting OTP', details: err.message });
+    console.error(err);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error', 
+      details: err.message 
+    });
   }
 });
 
+// API endpoint to verify OTP
+app.post('/verify-otp', async (req, res) => {
+  const { mobile_number, otp } = req.body;
+
+  if (!mobile_number || !otp) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Mobile number and OTP are required' 
+    });
+  }
+
+  try {
+    const isValid = await verifyOtp(mobile_number, otp);
+    
+    if (isValid) {
+      return res.status(200).json({ 
+        success: true, 
+        message: 'OTP verified successfully' 
+      });
+    } else {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid or expired OTP' 
+      });
+    }
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ 
+      success: false, 
+      message: 'Server error', 
+      details: err.message 
+    });
+  }
+});
+
+// Start the server
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
 });
-
-
-
-
-
-
-
-
-// const express = require('express');
-// const oracledb = require('oracledb');
-// const app = express();
-// const cors = require('cors');
-// const port = 5000;
-
-// oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
-
-// app.use(cors());
-
-
-// async function getPandaData() {
-//   let connection;
-//   try {
-//     connection = await oracledb.getConnection({
-//       user: "hr",
-//       password: "hr",
-//       connectionString: "localhost/xepdb1"
-//     });
-
-//     const result = await connection.execute(`SELECT * FROM panda`);
-
-//     return result.rows; 
-//   } catch (err) {
-//     console.error(err);
-//     return [];
-//   } finally {
-//     if (connection) {
-//       try {
-//         await connection.close();
-//       } catch (err) {
-//         console.error(err);
-//       }
-//     }
-//   }
-// }
-
-// app.get('/panda', async (req, res) => {
-//   const data = await getPandaData();
-//   res.json(data); 
-// });
-
-// app.listen(port, () => {
-//   console.log(`Server running on http://localhost:${port}`);
-// });
